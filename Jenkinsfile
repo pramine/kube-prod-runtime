@@ -7,6 +7,7 @@
 // - kubernetes
 // - jobcacher
 // - azure-credentials
+// - aws-credentials
 
 import groovy.json.JsonOutput
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
@@ -25,6 +26,29 @@ def withGo(Closure body) {
             "HOME=${env.WORKSPACE}",
         ]) {
             body()
+        }
+    }
+}
+
+// Wait for all Ingress resources to be destroyed
+def waitForDestroy(int minutes) {
+    withEnv(["PATH+KTOOL=${tool 'kubectl'}"]) {
+        try {
+            timeout(time: minutes, unit: 'MINUTES') {
+                sh """
+set +x
+echo -n "\nWaiting for all Ingress resources to be destroyed in all namespaces... "
+N=\$(kubectl get --all-namespaces ing | wc -l)
+while [ \$N -gt 0 ]; do
+  echo -n \$N ". "
+  N=\$(kubectl get --all-namespaces ing | wc -l)
+  sleep 5
+done
+"""
+            }
+        } catch(error) {
+            sh "kubectl get --all-namespaces ing"
+            throw error
         }
     }
 }
@@ -122,6 +146,13 @@ def runIntegrationTest(String description, String kubeprodArgs, String ginkgoArg
                         junit 'junit/*.xml'
                     }
                 }
+
+                withEnv(["PATH+KUBECFG=${tool 'kubecfg'}"]) {
+                    // This is required in some platforms like AWS in order to release/destroy
+                    // cloud resources like load balancers.
+                    sh "kubecfg -v delete kubeprod-manifest.jsonnet"
+                    waitForDestroy(10)
+                }
             }
         }
     }
@@ -152,6 +183,16 @@ spec:
     - 'cat'
   - name: 'az'
     image: 'microsoft/azure-cli:2.0.45'
+    tty: true
+    command:
+    - 'cat'
+  - name: 'eksctl'
+    image: 'weaveworks/eksctl:093ee46b-dirty-d45cade'
+    tty: true
+    command:
+    - 'cat'
+  - name: 'aws'
+    image: 'mesosphere/aws-cli:1.14.5'
     tty: true
     command:
     - 'cat'
@@ -239,12 +280,10 @@ spec:
                         dir('src/github.com/bitnami/kube-prod-runtime') {
                             timeout(time: 30) {
                                 unstash 'src'
-
-                                // TODO: use tool, once the next release is made
-                                sh 'go get github.com/ksonnet/kubecfg'
-
                                 dir('manifests') {
-                                    sh 'make validate KUBECFG="kubecfg -v"'
+                                    withEnv(["PATH+KUBECFG=${tool 'kubecfg'}"]) {
+                                        sh 'make validate KUBECFG="kubecfg -v"'
+                                    }
                                 }
                                 stash includes: 'manifests/**', excludes: 'manifests/Makefile', name: 'manifests'
                             }
@@ -491,6 +530,124 @@ az aks create                      \
         }
     }
 
+    def eksVersions = ["1.10", "1.11"]
+    for (x in eksVersions) {
+        def kversion = x // local bind required because closures
+        def platform = "eks-${kversion}"
+        def awsRegion = "us-east-1"
+        def awsZones = ["us-east-1b", "us-east-1f"]
+        platforms[platform] = {
+            stage(platform) {
+                node(label) {
+                    withCredentials([[
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-eks-kubeprod-jenkins',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY',
+                    ]]) {
+                        withGo() {
+                            withEnv([
+                                "AWS_DEFAULT_REGION=${awsRegion}",
+                                // https://docs.aws.amazon.com/eks/latest/userguide/install-aws-iam-authenticator.html
+                                "PATH+AWSIAMAUTHENTICATOR=${tool 'aws-iam-authenticator'}"
+                            ]) {
+                                dir('src/github.com/bitnami/kube-prod-runtime') {
+                                    def awsUserPoolId = "${awsRegion}_zkRzdsjxA"
+                                    def clusterName = ("${env.BRANCH_NAME}".take(8) + "-${env.BUILD_NUMBER}-" + UUID.randomUUID().toString().take(5) + "-${platform}").replaceAll(/[^a-zA-Z0-9]+/, '-').toLowerCase()
+                                    def dnsPrefix = "${clusterName}"
+                                    def adminEmail = "${clusterName}@${parentZone}"
+                                    def dnsZone = "${dnsPrefix}.${parentZone}"
+
+                                    try {
+                                        runIntegrationTest(platform, "eks --user-pool-id=${awsUserPoolId} --config=${clusterName}-autogen.json --dns-zone=${dnsZone} --email=${adminEmail}", "--dns-suffix ${dnsZone}") {
+                                            // Create EKS cluster: requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment
+                                            // variables to reference a user in AWS with the correct privileges to create an EKS
+                                            // cluster: https://github.com/weaveworks/eksctl/issues/204#issuecomment-450280786
+                                            container('eksctl') {
+                                                sh "eksctl create cluster --name ${clusterName} --region ${awsRegion} --zones ${awsZones.join(',')} --version ${kversion} --node-type m5.large --nodes 3 --timeout 60m --kubeconfig \$KUBECONFIG --tags 'platform=${platform},branch=${BRANCH_NAME},build=${BUILD_URL}'"
+                                                waitForRollout("kube-system", 30)
+                                            }
+
+                                            writeFile([file: 'kubeprod-manifest.jsonnet', text: """
+(import "manifests/platforms/eks.jsonnet") {
+  config:: import "${clusterName}-autogen.json",
+  letsencrypt_environment: "staging",
+  prometheus+: import "tests/testdata/prometheus-crashloop-alerts.jsonnet",
+}
+"""
+                                            ])
+                                        }{
+                                            // update glue records in parent zone
+                                            def nameServers = []
+                                            container('aws') {
+                                                def output = sh(returnStdout: true, script: """
+id=\$(aws route53 list-hosted-zones-by-name --dns-name "${dnsZone}" --max-items 1 --query 'HostedZones[0].Id' --output text)
+aws route53 get-hosted-zone --id "\$id" --query DelegationSet.NameServers
+"""
+                                                )
+                                                for (ns in readJSON(text: output)) {
+                                                    nameServers << ns
+                                                }
+                                            }
+                                            insertGlueRecords(dnsPrefix, nameServers, "60", parentZone, parentZoneResourceGroup)
+                                        }
+                                    } finally {
+                                        // Delete EKS cluster
+                                        container('eksctl') {
+                                            sh "eksctl delete cluster --name ${clusterName} --timeout 60m"
+                                        }
+                                        container('aws') {
+                                            withEnv([
+                                                "PATH+JQ=${tool 'jq'}",
+                                                "HOME=${env.WORKSPACE}",
+                                            ]) {
+                                                sh """
+                                                    #!/bin/bash
+                                                    set -x
+
+                                                    CONFIG="${clusterName}-autogen.json"
+
+                                                    ACCOUNT=\$(aws sts get-caller-identity --query Account --output text)
+                                                    aws iam detach-user-policy --user-name "bkpr-${dnsZone}" --policy-arn "arn:aws:iam::\${ACCOUNT}:policy/bkpr-${dnsZone}"
+                                                    aws iam delete-policy --policy-arn "arn:aws:iam::\${ACCOUNT}:policy/bkpr-${dnsZone}"
+
+                                                    ACCESS_KEY_ID=\$(cat \${CONFIG} | jq -r .externalDns.aws_access_key_id)
+                                                    aws iam delete-access-key --user-name "bkpr-${dnsZone}" --access-key-id "\${ACCESS_KEY_ID}"
+                                                    aws iam delete-user --user-name "bkpr-${dnsZone}"
+
+                                                    CLIENT_ID=\$(cat \${CONFIG} | jq -r .oauthProxy.client_id)
+                                                    aws cognito-idp delete-user-pool-client --user-pool-id "${awsUserPoolId}" --client-id "\${CLIENT_ID}"
+
+                                                    DNS_ZONE_ID=\$(aws route53 list-hosted-zones-by-name --dns-name "${dnsZone}" --max-items 1 --query 'HostedZones[0].Id' --output text)
+                                                    aws route53 list-resource-record-sets \
+                                                                --hosted-zone-id \${DNS_ZONE_ID} \
+                                                                --query '{ChangeBatch:{Changes:ResourceRecordSets[?Type != `NS` && Type != `SOA`].{Action:`DELETE`,ResourceRecordSet:@}}}' \
+                                                                --output json > changes
+
+                                                    aws route53 change-resource-record-sets \
+                                                                --cli-input-json file://changes \
+                                                                --hosted-zone-id \${DNS_ZONE_ID} \
+                                                                --query 'ChangeInfo.Id' \
+                                                                --output text
+
+                                                    aws route53 delete-hosted-zone \
+                                                                --id \${DNS_ZONE_ID} \
+                                                                --query 'ChangeInfo.Id' \
+                                                                --output text
+                                                """
+                                            }
+                                        }
+                                        deleteGlueRecords(dnsPrefix, parentZone, parentZoneResourceGroup)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     platforms.failFast = true
     parallel platforms
 
@@ -507,6 +664,7 @@ az aks create                      \
 
                             withCredentials([
                                 usernamePassword(credentialsId: 'github-bitnami-bot', passwordVariable: 'GITHUB_TOKEN', usernameVariable: ''),
+                                // AWS credentials used to publish Docker images to an AWS S3 bucket
                                 [
                                 $class: 'AmazonWebServicesCredentialsBinding',
                                 credentialsId: 'jenkins-bkpr-releases',
