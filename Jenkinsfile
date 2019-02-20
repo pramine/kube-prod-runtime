@@ -585,11 +585,17 @@ aws route53 get-hosted-zone --id "\$id" --query DelegationSet.NameServers
                                             insertGlueRecords(dnsPrefix, nameServers, "60", parentZone, parentZoneResourceGroup)
                                         }
                                     } finally {
-                                        withEnv(["PATH+KUBECFG=${tool 'kubecfg'}"]) {
-                                            // This is required in some platforms like AWS in order to release/destroy
-                                            // cloud resources like load balancers.
-                                            sh "kubecfg -v delete kubeprod-manifest.jsonnet"
-                                            waitForDestroy(30)
+                                        withCredentials([[
+                                            $class: 'AmazonWebServicesCredentialsBinding',
+                                            credentialsId: 'aws-eks-kubeprod-jenkins',
+                                            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                                            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY',
+                                        ]]) {
+                                            withEnv(["PATH+KUBECFG=${tool 'kubecfg'}"]) {
+                                                // This is required in to release/destroy cloud resources like load balancers.
+                                                sh "kubecfg -v delete kubeprod-manifest.jsonnet"
+                                                waitForDestroy(30)
+                                            }
                                         }
 
                                         // Delete EKS cluster
